@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cros.buildingos.ai</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    main {
+      max-width: 720px;
+      margin: 80px auto;
+      padding: 0 24px;
+    }
+    h1 {
+      margin-bottom: 12px;
+    }
+    p, li {
+      line-height: 1.6;
+    }
+    code {
+      background: #1e293b;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>cros server is running</h1>
+    <p>根域 <code>cros.buildingos.ai</code> 当前由 Nginx 提供这个示例页面。</p>
+    <p>HTTP 隧道子域名会被转发到 cros 服务端的 <code>3001</code> 端口。</p>
+    <ul>
+      <li>示例：<code>test.cros.buildingos.ai</code></li>
+      <li>客户端需要注册同名的 <code>remoteDomain</code></li>
+    </ul>
+  </main>
+</body>
+</html>

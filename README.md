@@ -59,6 +59,7 @@ cros client client.yml
 
 - 建议配合`nginx`一起使用
 > 因为可以通过`nginx`反向代理的方式实现`https`域名方式的内网穿透，还有使用`80`和`443`端口。
+> 如果服务端通过 Docker 部署到 `Zeabur`，也建议在容器内同时提供 `nginx`，对外暴露 `80` 端口并反向代理到 `server.js` 的 `3001`，否则 `http` 域名方式无法直接按 `80/443` 入口访问。
 ```
 server {
 	listen 80;
