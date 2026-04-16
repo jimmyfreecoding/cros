@@ -190,6 +190,22 @@ class TunnelServer {
     });
   }
 
+  isSocketAlive(socket) {
+    return !!socket && !socket.destroyed && socket.readable && socket.writable;
+  }
+
+  isSameClient(oldSocket, newSocket) {
+    if (!oldSocket || !newSocket) return false;
+    return oldSocket.remoteAddress === newSocket.remoteAddress;
+  }
+
+  takeoverClientRegistrations(oldSocket, newSocket, resourceLabel) {
+    if (!oldSocket || oldSocket === newSocket) return;
+    log.info('Server', `Take over ${resourceLabel} from ${oldSocket.remoteAddress} to ${newSocket.remoteAddress}`);
+    this.closeClientTunnalsAndServers(oldSocket);
+    oldSocket.destroy();
+  }
+
   closeClientTunnalsAndServers(clientSocket) {
     for (const [remotePort, socket] of this.tunnels.entries()) {
       if (socket === clientSocket) {
@@ -291,7 +307,20 @@ class TunnelServer {
 
   handleRegister(clientSocket, payload) {
     const remotePort = payload.readUInt16BE(0);
-    if (this.tunnels.has(remotePort)) return;
+    const currentSocket = this.tunnels.get(remotePort);
+    if (currentSocket) {
+      if (currentSocket === clientSocket) {
+        this.sendNoticePacket(clientSocket, this.buildNoticeTcpJson(true, remotePort, '远程端口已开放'));
+        return;
+      }
+
+      if (!this.isSocketAlive(currentSocket) || this.isSameClient(currentSocket, clientSocket)) {
+        this.takeoverClientRegistrations(currentSocket, clientSocket, `tcp:${remotePort}`);
+      } else {
+        this.sendNoticePacket(clientSocket, this.buildNoticeTcpJson(false, remotePort, '端口已被占用'));
+        return;
+      }
+    }
     
     this.tunnels.set(remotePort, clientSocket);
     log.info('Server', `Registered port ${remotePort}`);
@@ -305,9 +334,19 @@ class TunnelServer {
    */
   handleHttpRegister(clientSocket, payload) {
     const domain = payload.toString('utf8');
-    if (this.httpTunnels.has(domain)) {
-      this.sendNoticePacket(clientSocket, this.buildNoticeHttpJson(false, domain, '域名已被占用'));
-      return;
+    const currentSocket = this.httpTunnels.get(domain);
+    if (currentSocket) {
+      if (currentSocket === clientSocket) {
+        this.sendNoticePacket(clientSocket, this.buildNoticeHttpJson(true, domain, '域名注册成功'));
+        return;
+      }
+
+      if (!this.isSocketAlive(currentSocket) || this.isSameClient(currentSocket, clientSocket)) {
+        this.takeoverClientRegistrations(currentSocket, clientSocket, `http:${domain}`);
+      } else {
+        this.sendNoticePacket(clientSocket, this.buildNoticeHttpJson(false, domain, '域名已被占用'));
+        return;
+      }
     }
 
     this.httpTunnels.set(domain, clientSocket);

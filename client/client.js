@@ -6,7 +6,6 @@ const path = require('path');
 const yaml = require('js-yaml');
 const crypto = require('crypto');
 const log = require('../common/logger.js');
-const { clear } = require('console');
 
 class TunnelClient {
   constructor(configPath) {
@@ -20,6 +19,12 @@ class TunnelClient {
     this.receiveBuffer = Buffer.alloc(0);
     this.heartbeatInterval = 10000; // 10秒心跳间隔
     this.heartbeatTimer = null;
+    this.reconnectDelay = 2000;
+    this.maxReconnectDelay = 10000;
+    this.reconnectTimer = null;
+    this.registerRetryDelay = 2000;
+    this.registerRetryTimers = new Map();
+    this.connected = false;
     // 加密配置
     this.cryptoConfig = {
       algorithm: 'aes-256-gcm',
@@ -55,41 +60,56 @@ class TunnelClient {
   }
 
   validateConfig() {
-    const ports = new Set();
+    const tcpPorts = new Set();
+    const httpDomains = new Set();
     this.config.tunnels.forEach(tunnel => {
-      if (ports.has(tunnel.remotePort)) {
-        throw new Error(`Duplicate remote port ${tunnel.remotePort}`);
+      if (tunnel.type === 'tcp') {
+        if (tcpPorts.has(tunnel.remotePort)) {
+          throw new Error(`Duplicate remote port ${tunnel.remotePort}`);
+        }
+        tcpPorts.add(tunnel.remotePort);
+      } else if (tunnel.type === 'http') {
+        if (httpDomains.has(tunnel.remoteDomain)) {
+          throw new Error(`Duplicate remote domain ${tunnel.remoteDomain}`);
+        }
+        httpDomains.add(tunnel.remoteDomain);
       }
-      ports.add(tunnel.remotePort);
     });
   }
 
   connectToServer() {
-    this.controlSocket = net.connect({
+    if (this.controlSocket && !this.controlSocket.destroyed) {
+      this.controlSocket.removeAllListeners();
+      this.controlSocket.destroy();
+    }
+
+    this.receiveBuffer = Buffer.alloc(0);
+    const socket = net.connect({
       port: this.config.server.port,
       host: this.config.server.host
     });
+    this.controlSocket = socket;
 
-    this.controlSocket.on('connect', () => {
-      log.info('Client', 'Connected to server'); 
+    socket.on('connect', () => {
+      this.connected = true;
+      this.reconnectDelay = 2000;
+      this.clearReconnectTimer();
+      this.startHeartbeat();
+      log.info('Client', 'Connected to server');
       this.registerTunnels();
     });
 
-    // 启动心跳定时器
-    this.heartbeatTimer = setInterval(() => {
-      const packet = Buffer.alloc(1);
-      packet.writeUInt8(0x48, 0); // 'H' 心跳包
-      this.sendPacket(packet);
-    }, this.heartbeatInterval);
-
-    this.controlSocket.on('data', data => this.processData(data));
-    this.controlSocket.on('error', err => {
+    socket.on('data', data => this.processData(data));
+    socket.on('error', err => {
       log.error('Client', `Control socket error: ${err.message}`);
     });
-    this.controlSocket.on('close', () => {
-      clearInterval(this.heartbeatTimer);
+    socket.on('close', () => {
+      if (this.controlSocket !== socket) return;
+      this.connected = false;
+      this.stopHeartbeat();
       this.clearClient();
-      log.error('Client', `Control socket close`);
+      log.error('Client', 'Control socket close');
+      this.scheduleReconnect();
     });
   }
 
@@ -99,38 +119,113 @@ class TunnelClient {
     this.connections.forEach(({ socket }) => socket.destroy()); 
     this.connections.clear();
     this.httpConnections.forEach(({ ws, req }) => {
-      if(req){
-        req.end();
+      if (req) {
+        req.destroy();
       }
-      if(ws){
+      if (ws) {
         ws.close();
       }
     });
     this.httpConnections.clear();
   }
 
+  startHeartbeat() {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      if (!this.connected) return;
+      const packet = Buffer.alloc(1);
+      packet.writeUInt8(0x48, 0); // 'H' 心跳包
+      this.sendPacket(packet);
+    }, this.heartbeatInterval);
+  }
+
+  stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  scheduleReconnect() {
+    if (this.reconnectTimer) return;
+    const delay = this.reconnectDelay;
+    log.info('Client', `Reconnect in ${delay}ms`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connectToServer();
+    }, delay);
+    this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
+  }
+
+  clearReconnectTimer() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  getTunnelKey(tunnel) {
+    if (tunnel.type === 'http') return `http:${tunnel.remoteDomain}`;
+    return `tcp:${tunnel.remotePort}`;
+  }
+
+  registerTunnel(tunnel) {
+    if (!this.connected) return;
+
+    if (tunnel.type === 'http') {
+      const domainBuffer = Buffer.from(tunnel.remoteDomain, 'utf8');
+      const buffer = Buffer.alloc(2 + domainBuffer.length);
+      buffer.writeUInt8(0x52, 0); // 'R' 注册命令
+      buffer.writeUInt8(0x48, 1); // 'H' 注册命令 HTTP 子命令
+      domainBuffer.copy(buffer, 2);
+      this.sendPacket(buffer);
+      return;
+    }
+
+    if (tunnel.type === 'tcp') {
+      const buffer = Buffer.alloc(3);
+      buffer.writeUInt8(0x52, 0); // 'R' 注册命令
+      buffer.writeUInt16BE(tunnel.remotePort, 1);
+      this.sendPacket(buffer);
+      return;
+    }
+
+    log.error('Client', `Tunnel type error: ${tunnel.type}`);
+  }
+
+  scheduleTunnelRegisterRetry(tunnel) {
+    if (!tunnel || !this.connected) return;
+    const key = this.getTunnelKey(tunnel);
+    if (this.registerRetryTimers.has(key)) return;
+
+    const timer = setTimeout(() => {
+      this.registerRetryTimers.delete(key);
+      this.registerTunnel(tunnel);
+    }, this.registerRetryDelay);
+    this.registerRetryTimers.set(key, timer);
+    log.info('Client', `Retry register ${key} in ${this.registerRetryDelay}ms`);
+  }
+
+  clearTunnelRegisterRetry(key) {
+    const timer = this.registerRetryTimers.get(key);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.registerRetryTimers.delete(key);
+  }
+
+  clearRegisterRetryTimers() {
+    this.registerRetryTimers.forEach(timer => clearTimeout(timer));
+    this.registerRetryTimers.clear();
+  }
+
   registerTunnels() {
     const sentPorts = new Set();
     this.config.tunnels.forEach(tunnel => {
-      if (tunnel.type === 'http') {
-        if (sentPorts.has(tunnel.remoteDomain)) return;
-        sentPorts.add(tunnel.remoteDomain);
-        const domainBudder = Buffer.from(tunnel.remoteDomain, 'utf8');
-        const buffer = Buffer.alloc(2 + domainBudder.length); 
-        buffer.writeUInt8(0x52, 0); // 'R' 注册命令
-        buffer.writeUInt8(0x48, 1); // 'H' 注册命令 HTTP 子命令
-        domainBudder.copy(buffer, 2); // 复制域名到缓冲区
-        this.sendPacket(buffer);
-      }else if(tunnel.type === 'tcp') {
-        if (sentPorts.has(tunnel.remotePort)) return;
-        sentPorts.add(tunnel.remotePort);
-        const buffer = Buffer.alloc(3);
-        buffer.writeUInt8(0x52, 0); // 'R' 注册命令
-        buffer.writeUInt16BE(tunnel.remotePort, 1);
-        this.sendPacket(buffer);
-      }else {
-        log.error('Client', `Tunnel type error: ${tunnel.type}`);
-      }
+      const uniqueKey = tunnel.type === 'http' ? tunnel.remoteDomain : tunnel.remotePort;
+      if (sentPorts.has(uniqueKey)) return;
+      sentPorts.add(uniqueKey);
+      this.clearTunnelRegisterRetry(this.getTunnelKey(tunnel));
+      this.registerTunnel(tunnel);
     });
   }
 
@@ -279,7 +374,8 @@ class TunnelClient {
 
     // 处理错误
     ws.on('error', (err) => {
-      console.error('Error:', err);
+      log.error('Client', `Local websocket error (${tunnel.localHost}:${tunnel.localPort}): ${err.message}`);
+      this.httpConnections.delete(connectionId);
     });
   }
 
@@ -342,18 +438,31 @@ class TunnelClient {
         });
       });
 
+      req.on('error', (err) => {
+        log.error('Client', `HTTP connection error (${tunnel.localHost}:${tunnel.localPort}): ${err.message}`);
+        this.httpConnections.delete(connectionId);
+        this.sendHttpError(connectionId, err.message);
+      });
+
       this.httpConnections.set(connectionId, {
         req: req
       });
     } catch (e) {
       log.error('Client', `HTTP connection error: ${e.message}`);
-      this.sendHttpError(connectionId);
+      this.sendHttpError(connectionId, e.message);
     }
   }
 
   handleNotice(payload) {
     const noticeJson = JSON.parse(payload.toString('utf8'));
+    const key = noticeJson.type === 'http'
+      ? `http:${noticeJson.remoteDomain}`
+      : noticeJson.type === 'tcp'
+        ? `tcp:${noticeJson.remotePort}`
+        : null;
+
     if(noticeJson.success === true) {
+      if (key) this.clearTunnelRegisterRetry(key);
       if(noticeJson.type === 'tcp') {
         log.info('Client', `Tunnel ${noticeJson.remotePort} is available`);
       }else if(noticeJson.type === 'http') {
@@ -368,6 +477,15 @@ class TunnelClient {
         log.info('Client', `Tunnel ${noticeJson.remoteDomain} is unavailable, message = ${noticeJson.message}`);
       }else {
         log.info('Client', `Other message ${noticeJson.message}`);
+      }
+
+      if (noticeJson.message && noticeJson.message.includes('已被占用')) {
+        const tunnel = this.config.tunnels.find(item => {
+          if (noticeJson.type === 'http') return item.type === 'http' && item.remoteDomain === noticeJson.remoteDomain;
+          if (noticeJson.type === 'tcp') return item.type === 'tcp' && item.remotePort === noticeJson.remotePort;
+          return false;
+        });
+        this.scheduleTunnelRegisterRetry(tunnel);
       }
     }
   }
@@ -439,10 +557,45 @@ class TunnelClient {
   }
 
   sendPacket(data) {
+    if (!this.controlSocket || this.controlSocket.destroyed || !this.controlSocket.writable) {
+      return false;
+    }
     const lengthHeader = Buffer.alloc(4);
     const encryptedData = this.encrypt(data);
     lengthHeader.writeUInt32BE(encryptedData.length, 0);
     this.controlSocket.write(Buffer.concat([lengthHeader, encryptedData]));
+    return true;
+  }
+
+  sendHttpError(connectionId, message = 'Bad Gateway') {
+    const headerJson = {
+      statusCode: 502,
+      statusMessage: 'Bad Gateway',
+      headers: {
+        'content-type': 'text/plain; charset=utf-8'
+      }
+    };
+    const body = Buffer.from(`Upstream unavailable: ${message}`, 'utf8');
+    const headerPacket = Buffer.concat([
+      Buffer.from([0x45]),
+      this.buildConnectiongIdBuffer(connectionId),
+      Buffer.from([0x43]),
+      Buffer.from(JSON.stringify(headerJson), 'utf8')
+    ]);
+    const dataPacket = Buffer.concat([
+      Buffer.from([0x45]),
+      this.buildConnectiongIdBuffer(connectionId),
+      Buffer.from([0x44]),
+      body
+    ]);
+    const endPacket = Buffer.concat([
+      Buffer.from([0x45]),
+      this.buildConnectiongIdBuffer(connectionId),
+      Buffer.from([0x45])
+    ]);
+    this.sendPacket(headerPacket);
+    this.sendPacket(dataPacket);
+    this.sendPacket(endPacket);
   }
 
   buildConnectiongIdBuffer(connectionId) {
