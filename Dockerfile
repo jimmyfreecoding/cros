@@ -22,4 +22,4 @@ RUN chmod +x /app/docker/start.sh
 EXPOSE 80 3000
 
 # Start Node server and Nginx
-CMD ["/app/docker/start.sh"]
+CMD ["sh", "/app/docker/start.sh"]
